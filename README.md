@@ -2,43 +2,47 @@
 
 One-script setup for [OpenClaw](https://docs.openclaw.ai/) — AI gateway with LINE, Telegram, and more.
 
-**Only requirement: Docker.**
-
-## What it does
-
-- Builds an OpenClaw Docker image (Node.js + OpenClaw)
-- Sets up **Traefik** (reverse proxy + auto SSL) + **n8n** (workflow automation) + **OpenClaw** (AI gateway)
-- Creates workspace templates (AGENTS.md, SOUL.md, BOOTSTRAP.md, etc.)
-- Generates `docker-compose.yml` and `.env` — just fill in your credentials and `docker compose up -d`
+**Only requirement: Docker.** Works on VPS or local machine.
 
 ## Quick start
 
 ```bash
+git clone https://github.com/Boom-Vitt/openclaw-setup.git
+cd openclaw-setup
 bash setup-openclaw.sh
 ```
 
 Then:
 
-1. Edit `~/openclaw-setup/.env` — set your domain, email, timezone
-2. Edit `~/.openclaw/openclaw.json` — set your API keys, LINE/Telegram tokens
-3. Start:
-   ```bash
-   cd ~/openclaw-setup && docker compose up -d
-   ```
-4. Or run the interactive wizard:
-   ```bash
-   docker compose run --rm openclaw configure
-   ```
+1. Edit `~/.openclaw/openclaw.json` — set your API keys + LINE/Telegram tokens
+2. Start: `docker compose up -d`
+3. Or run the wizard: `docker compose run --rm openclaw configure`
 
-## What's NOT included (you provide these)
+## What's included
 
-- AI provider API keys
-- LINE channel access token & secret
-- Telegram bot token
-- Domain name & SSL email
+- Dockerfile (Node 22 + OpenClaw)
+- docker-compose.yml
+- Workspace templates (AGENTS.md, SOUL.md, BOOTSTRAP.md, etc.)
+- Auto-generated gateway auth token
 
-## Works on
+## What you provide
 
-- Linux (Ubuntu, Debian, Fedora, Arch, Alpine)
-- macOS
-- Windows (WSL / Git Bash)
+- AI model provider + API key
+- LINE channel access token & secret (optional)
+- Telegram bot token (optional)
+
+## Deploy
+
+**VPS:**
+```bash
+bash setup-openclaw.sh
+docker compose up -d
+```
+
+**Local machine:**
+```bash
+bash setup-openclaw.sh
+docker compose up -d
+```
+
+Same command everywhere.

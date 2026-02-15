@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # OpenClaw Docker Setup
-# Only requirement: Docker. Works on Linux / macOS / Windows (WSL).
-# Creates Dockerfile + docker-compose + workspace templates, then starts it.
+# Only requirement: Docker. Deploy on VPS or local machine.
 # ============================================================================
 set -euo pipefail
 
@@ -13,7 +12,7 @@ warn()  { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
 err()   { printf "${RED}[ERR]${NC}   %s\n" "$*"; exit 1; }
 
 USER_HOME="${HOME:-$(eval echo ~)}"
-SETUP_DIR="$USER_HOME/openclaw-setup"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OPENCLAW_DATA="$USER_HOME/.openclaw"
 WORKSPACE_DIR="$OPENCLAW_DATA/workspace"
 
@@ -25,176 +24,76 @@ check_docker() {
   if ! docker info &>/dev/null 2>&1; then
     err "Docker daemon is not running. Start Docker first."
   fi
-  ok "Docker $(docker --version | grep -oP '\d+\.\d+\.\d+')"
+  ok "Docker $(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 }
 
 # ── Generate random token ──────────────────────────────────────────────────
 gen_token() {
   if command -v openssl &>/dev/null; then
     openssl rand -hex 24
+  elif [ -r /dev/urandom ]; then
+    head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'
   else
-    head -c 24 /dev/urandom | xxd -p 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-'
+    date +%s%N | sha256sum | head -c 48
   fi
 }
 
-# ── Create project directory ────────────────────────────────────────────────
+# ── Create directories ─────────────────────────────────────────────────────
 setup_dirs() {
-  info "Creating project structure..."
-  mkdir -p "$SETUP_DIR"
+  info "Creating directories..."
   mkdir -p "$OPENCLAW_DATA"/{agents/main,canvas,credentials,cron/runs,devices,extensions,identity}
   mkdir -p "$WORKSPACE_DIR/memory"
-  mkdir -p "$SETUP_DIR/traefik-config"
   ok "Directories created"
 }
 
 # ── Dockerfile ──────────────────────────────────────────────────────────────
 write_dockerfile() {
   info "Writing Dockerfile..."
-  cat > "$SETUP_DIR/Dockerfile" << 'DEOF'
+  cat > "$SCRIPT_DIR/Dockerfile" << 'EOF'
 FROM node:22-slim
-
 RUN npm install -g openclaw && \
     apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
-
 VOLUME /root/.openclaw
 EXPOSE 18789
-
 ENTRYPOINT ["openclaw"]
 CMD ["gateway", "--port", "18789"]
-DEOF
+EOF
   ok "Dockerfile"
 }
 
 # ── docker-compose.yml ──────────────────────────────────────────────────────
 write_compose() {
   info "Writing docker-compose.yml..."
-  cat > "$SETUP_DIR/docker-compose.yml" << 'CEOF'
+  cat > "$SCRIPT_DIR/docker-compose.yml" << CEOF
 services:
-  # ── Traefik (reverse proxy + auto SSL) ──
-  traefik:
-    image: traefik:latest
-    restart: always
-    command:
-      - "--api=true"
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.file.directory=/etc/traefik/dynamic"
-      - "--providers.file.watch=true"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
-      - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"
-      - "--certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL:-admin@localhost}"
-      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - traefik_data:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik-config:/etc/traefik/dynamic:ro
-
-  # ── n8n (workflow automation) ──
-  n8n:
-    image: docker.n8n.io/n8nio/n8n
-    restart: always
-    ports:
-      - "127.0.0.1:5678:5678"
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.n8n.rule=Host(`${N8N_SUBDOMAIN:-n8n}.${DOMAIN_NAME:-localhost}`)
-      - traefik.http.routers.n8n.tls=true
-      - traefik.http.routers.n8n.entrypoints=web,websecure
-      - traefik.http.routers.n8n.tls.certresolver=mytlschallenge
-    environment:
-      - N8N_HOST=${N8N_SUBDOMAIN:-n8n}.${DOMAIN_NAME:-localhost}
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=https
-      - NODE_ENV=production
-      - WEBHOOK_URL=https://${N8N_SUBDOMAIN:-n8n}.${DOMAIN_NAME:-localhost}/
-      - GENERIC_TIMEZONE=${TZ:-UTC}
-      - N8N_PROXY_HOPS=1
-    volumes:
-      - n8n_data:/home/node/.n8n
-
-  # ── OpenClaw (AI gateway + LINE/Telegram) ──
   openclaw:
     build: .
-    restart: always
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.openclaw.rule=Host(`${OPENCLAW_SUBDOMAIN:-openclaw}.${DOMAIN_NAME:-localhost}`)
-      - traefik.http.routers.openclaw.tls=true
-      - traefik.http.routers.openclaw.entrypoints=web,websecure
-      - traefik.http.routers.openclaw.tls.certresolver=mytlschallenge
-      - traefik.http.services.openclaw.loadbalancer.server.port=18789
-    volumes:
-      - ${OPENCLAW_DATA:-~/.openclaw}:/root/.openclaw
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:18789:18789"
-
-volumes:
-  traefik_data:
-  n8n_data:
+      - "\${OPENCLAW_PORT:-18789}:18789"
+    volumes:
+      - ${OPENCLAW_DATA}:/root/.openclaw
 CEOF
   ok "docker-compose.yml"
 }
 
-# ── .env template ───────────────────────────────────────────────────────────
+# ── .env ────────────────────────────────────────────────────────────────────
 write_env() {
-  local ENV_FILE="$SETUP_DIR/.env"
+  local ENV_FILE="$SCRIPT_DIR/.env"
   if [ -f "$ENV_FILE" ]; then
     warn ".env already exists, skipping"
     return
   fi
-
   info "Writing .env..."
-  cat > "$ENV_FILE" << EOF
-# ── Domain ──
-DOMAIN_NAME=your.domain.com
-N8N_SUBDOMAIN=n8n
-OPENCLAW_SUBDOMAIN=openclaw
-SSL_EMAIL=you@example.com
-TZ=UTC
-
-# ── OpenClaw data path ──
-OPENCLAW_DATA=$OPENCLAW_DATA
+  cat > "$ENV_FILE" << 'EOF'
+# Port to expose OpenClaw gateway (default 18789)
+OPENCLAW_PORT=18789
 EOF
-  ok ".env template"
+  ok ".env"
 }
 
-# ── Traefik dynamic route for OpenClaw ──────────────────────────────────────
-write_traefik_config() {
-  info "Writing Traefik dynamic config..."
-
-  # When using docker provider with labels, this file is optional.
-  # Kept as fallback for non-docker setups.
-  cat > "$SETUP_DIR/traefik-config/openclaw.yml" << 'TEOF'
-# This file is a fallback. Docker labels in docker-compose.yml handle routing.
-# Uncomment below if you run OpenClaw outside Docker and need Traefik to proxy.
-#
-# http:
-#   routers:
-#     openclaw:
-#       rule: "Host(`openclaw.YOUR_DOMAIN`)"
-#       service: openclaw
-#       entrypoints:
-#         - websecure
-#       tls:
-#         certResolver: mytlschallenge
-#   services:
-#     openclaw:
-#       loadBalancer:
-#         servers:
-#           - url: "http://host.docker.internal:18789"
-TEOF
-  ok "Traefik config"
-}
-
-# ── Workspace template files ────────────────────────────────────────────────
+# ── Workspace templates ─────────────────────────────────────────────────────
 write_workspace() {
   info "Writing workspace templates..."
 
@@ -305,7 +204,6 @@ EOF
 # Add periodic tasks below. Leave empty to skip heartbeat API calls.
 EOF
 
-  # Cron template
   cat > "$OPENCLAW_DATA/cron/jobs.json" << 'EOF'
 {
   "version": 1,
@@ -316,15 +214,18 @@ EOF
   ok "Workspace templates"
 }
 
-# ── OpenClaw config template ───────────────────────────────────────────────
-write_openclaw_config() {
+# ── OpenClaw config ─────────────────────────────────────────────────────────
+write_config() {
   local CFG="$OPENCLAW_DATA/openclaw.json"
   if [ -f "$CFG" ]; then
-    warn "openclaw.json already exists, saving template as openclaw.json.template"
+    warn "openclaw.json already exists, template saved as openclaw.json.template"
     CFG="$OPENCLAW_DATA/openclaw.json.template"
   fi
 
-  info "Writing OpenClaw config template..."
+  local TOKEN
+  TOKEN="$(gen_token)"
+
+  info "Writing OpenClaw config..."
   cat > "$CFG" << JEOF
 {
   "agents": {
@@ -332,7 +233,7 @@ write_openclaw_config() {
       "model": {
         "primary": "YOUR_PROVIDER/YOUR_MODEL"
       },
-      "workspace": "$WORKSPACE_DIR",
+      "workspace": "/root/.openclaw/workspace",
       "compaction": { "mode": "safeguard" },
       "maxConcurrent": 4,
       "subagents": { "maxConcurrent": 8 }
@@ -358,7 +259,7 @@ write_openclaw_config() {
     "bind": "0.0.0.0",
     "auth": {
       "mode": "token",
-      "token": "$(gen_token)"
+      "token": "$TOKEN"
     }
   },
   "skills": { "install": { "nodeManager": "npm" } },
@@ -373,34 +274,27 @@ JEOF
   ok "OpenClaw config: $CFG"
 }
 
-# ── Print summary ──────────────────────────────────────────────────────────
+# ── Summary ─────────────────────────────────────────────────────────────────
 print_done() {
   echo ""
   echo "============================================================================"
-  printf "${GREEN}  Setup Complete!${NC}\n"
+  printf "${GREEN}  OpenClaw is ready!${NC}\n"
   echo "============================================================================"
-  echo ""
-  echo "  Project:   $SETUP_DIR/"
-  echo "  Data:      $OPENCLAW_DATA/"
-  echo "  Workspace: $WORKSPACE_DIR/"
   echo ""
   printf "  ${YELLOW}NEXT STEPS:${NC}\n"
   echo ""
   echo "  1. Edit your credentials:"
+  echo "     $OPENCLAW_DATA/openclaw.json"
+  echo "     - Set model provider + API key"
+  echo "     - Set LINE or Telegram tokens"
   echo ""
-  echo "     $SETUP_DIR/.env                  # domain, email, timezone"
-  echo "     $OPENCLAW_DATA/openclaw.json     # API keys, LINE/Telegram tokens"
+  echo "  2. Start:"
+  echo "     cd $SCRIPT_DIR && docker compose up -d"
   echo ""
-  echo "  2. Start everything:"
-  echo ""
-  echo "     cd $SETUP_DIR && docker compose up -d"
-  echo ""
-  echo "  3. Or run the interactive wizard inside the container:"
-  echo ""
+  echo "  3. Or use the wizard:"
   echo "     docker compose run --rm openclaw configure"
   echo ""
-  echo "  4. Check status:"
-  echo ""
+  echo "  4. Logs:"
   echo "     docker compose logs -f openclaw"
   echo ""
   echo "============================================================================"
@@ -419,9 +313,8 @@ main() {
   write_dockerfile
   write_compose
   write_env
-  write_traefik_config
   write_workspace
-  write_openclaw_config
+  write_config
 
   print_done
 }
