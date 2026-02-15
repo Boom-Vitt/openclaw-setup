@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
 # OpenClaw Docker Setup
-# Only requirement: Docker. Deploy on VPS or local machine.
+# Only requirement: Docker.
+#   VPS mode  → Traefik + auto SSL + openclaw.yourdomain.com
+#   Local mode → localhost:18789
 # ============================================================================
 set -euo pipefail
 
@@ -18,12 +20,8 @@ WORKSPACE_DIR="$OPENCLAW_DATA/workspace"
 
 # ── Check Docker ────────────────────────────────────────────────────────────
 check_docker() {
-  if ! command -v docker &>/dev/null; then
-    err "Docker is required. Install it from https://docs.docker.com/get-docker/"
-  fi
-  if ! docker info &>/dev/null 2>&1; then
-    err "Docker daemon is not running. Start Docker first."
-  fi
+  command -v docker &>/dev/null || err "Docker required. Install: https://docs.docker.com/get-docker/"
+  docker info &>/dev/null 2>&1  || err "Docker daemon not running. Start Docker first."
   ok "Docker $(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 }
 
@@ -38,12 +36,47 @@ gen_token() {
   fi
 }
 
+# ── Ask deploy mode ────────────────────────────────────────────────────────
+ask_mode() {
+  echo ""
+  echo "  Where are you deploying?"
+  echo ""
+  echo "    1) VPS   — public server with domain (adds Traefik + auto SSL)"
+  echo "    2) Local — your machine, localhost access only"
+  echo ""
+  printf "  Choose [1/2]: "
+  read -r MODE_INPUT
+  case "${MODE_INPUT:-2}" in
+    1|vps|VPS)   DEPLOY_MODE="vps" ;;
+    *)           DEPLOY_MODE="local" ;;
+  esac
+  ok "Deploy mode: $DEPLOY_MODE"
+
+  if [ "$DEPLOY_MODE" = "vps" ]; then
+    echo ""
+    printf "  Your domain (e.g. srv1068766.hstgr.cloud): "
+    read -r DOMAIN_NAME
+    [ -z "${DOMAIN_NAME:-}" ] && err "Domain is required for VPS mode."
+
+    printf "  SSL email (for Let's Encrypt): "
+    read -r SSL_EMAIL
+    [ -z "${SSL_EMAIL:-}" ] && SSL_EMAIL="admin@$DOMAIN_NAME"
+
+    printf "  Timezone (e.g. Asia/Bangkok) [UTC]: "
+    read -r TZ_INPUT
+    TZ_VAL="${TZ_INPUT:-UTC}"
+
+    ok "Domain: openclaw.$DOMAIN_NAME"
+  fi
+}
+
 # ── Create directories ─────────────────────────────────────────────────────
 setup_dirs() {
   info "Creating directories..."
   mkdir -p "$OPENCLAW_DATA"/{agents/main,canvas,credentials,cron/runs,devices,extensions,identity}
   mkdir -p "$WORKSPACE_DIR/memory"
-  ok "Directories created"
+  [ "$DEPLOY_MODE" = "vps" ] && mkdir -p "$SCRIPT_DIR/traefik-config"
+  ok "Directories"
 }
 
 # ── Dockerfile ──────────────────────────────────────────────────────────────
@@ -65,32 +98,92 @@ EOF
 # ── docker-compose.yml ──────────────────────────────────────────────────────
 write_compose() {
   info "Writing docker-compose.yml..."
-  cat > "$SCRIPT_DIR/docker-compose.yml" << CEOF
+
+  if [ "$DEPLOY_MODE" = "vps" ]; then
+    # ── VPS: Traefik + OpenClaw ──
+    cat > "$SCRIPT_DIR/docker-compose.yml" << CEOF
+services:
+  # ── Traefik (reverse proxy + auto SSL) ──
+  traefik:
+    image: traefik:latest
+    restart: always
+    command:
+      - "--api=true"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"
+      - "--certificatesresolvers.mytlschallenge.acme.email=$SSL_EMAIL"
+      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - traefik_data:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik-config:/etc/traefik/dynamic:ro
+
+  # ── OpenClaw (AI gateway) ──
+  openclaw:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18789:18789"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.openclaw.rule=Host(\`openclaw.$DOMAIN_NAME\`)
+      - traefik.http.routers.openclaw.tls=true
+      - traefik.http.routers.openclaw.entrypoints=web,websecure
+      - traefik.http.routers.openclaw.tls.certresolver=mytlschallenge
+      - traefik.http.services.openclaw.loadbalancer.server.port=18789
+    volumes:
+      - $OPENCLAW_DATA:/root/.openclaw
+
+volumes:
+  traefik_data:
+CEOF
+
+    # ── Traefik dynamic config (fallback route) ──
+    cat > "$SCRIPT_DIR/traefik-config/openclaw.yml" << TEOF
+http:
+  routers:
+    openclaw:
+      rule: "Host(\`openclaw.$DOMAIN_NAME\`)"
+      service: openclaw
+      entrypoints:
+        - websecure
+      tls:
+        certResolver: mytlschallenge
+  services:
+    openclaw:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:18789"
+TEOF
+
+  else
+    # ── Local: just OpenClaw ──
+    cat > "$SCRIPT_DIR/docker-compose.yml" << CEOF
 services:
   openclaw:
     build: .
     restart: unless-stopped
     ports:
-      - "\${OPENCLAW_PORT:-18789}:18789"
+      - "18789:18789"
     volumes:
-      - ${OPENCLAW_DATA}:/root/.openclaw
+      - $OPENCLAW_DATA:/root/.openclaw
 CEOF
-  ok "docker-compose.yml"
-}
-
-# ── .env ────────────────────────────────────────────────────────────────────
-write_env() {
-  local ENV_FILE="$SCRIPT_DIR/.env"
-  if [ -f "$ENV_FILE" ]; then
-    warn ".env already exists, skipping"
-    return
   fi
-  info "Writing .env..."
-  cat > "$ENV_FILE" << 'EOF'
-# Port to expose OpenClaw gateway (default 18789)
-OPENCLAW_PORT=18789
-EOF
-  ok ".env"
+
+  ok "docker-compose.yml ($DEPLOY_MODE)"
 }
 
 # ── Workspace templates ─────────────────────────────────────────────────────
@@ -225,6 +318,19 @@ write_config() {
   local TOKEN
   TOKEN="$(gen_token)"
 
+  # Build remote block for VPS mode
+  local REMOTE_BLOCK=""
+  if [ "$DEPLOY_MODE" = "vps" ]; then
+    REMOTE_BLOCK="$(cat << REOF
+,
+    "remote": {
+      "url": "wss://openclaw.$DOMAIN_NAME",
+      "token": "$TOKEN"
+    }
+REOF
+)"
+  fi
+
   info "Writing OpenClaw config..."
   cat > "$CFG" << JEOF
 {
@@ -260,7 +366,7 @@ write_config() {
     "auth": {
       "mode": "token",
       "token": "$TOKEN"
-    }
+    }$REMOTE_BLOCK
   },
   "skills": { "install": { "nodeManager": "npm" } },
   "plugins": {
@@ -271,7 +377,7 @@ write_config() {
   }
 }
 JEOF
-  ok "OpenClaw config: $CFG"
+  ok "OpenClaw config → $CFG"
 }
 
 # ── Summary ─────────────────────────────────────────────────────────────────
@@ -281,22 +387,44 @@ print_done() {
   printf "${GREEN}  OpenClaw is ready!${NC}\n"
   echo "============================================================================"
   echo ""
+
+  if [ "$DEPLOY_MODE" = "vps" ]; then
+    echo "  Mode:      VPS (Traefik + auto SSL)"
+    echo "  URL:       https://openclaw.$DOMAIN_NAME"
+    echo "  Webhook:   https://openclaw.$DOMAIN_NAME/webhook/line"
+    echo ""
+  else
+    echo "  Mode:      Local"
+    echo "  URL:       http://localhost:18789"
+    echo ""
+  fi
+
   printf "  ${YELLOW}NEXT STEPS:${NC}\n"
   echo ""
-  echo "  1. Edit your credentials:"
+  echo "  1. Edit credentials:"
   echo "     $OPENCLAW_DATA/openclaw.json"
-  echo "     - Set model provider + API key"
-  echo "     - Set LINE or Telegram tokens"
+  echo "       - model provider + API key"
+  echo "       - LINE channel token & secret"
+  echo "       - Telegram bot token (optional)"
   echo ""
   echo "  2. Start:"
-  echo "     cd $SCRIPT_DIR && docker compose up -d"
+  echo "     cd $SCRIPT_DIR && docker compose up -d --build"
   echo ""
-  echo "  3. Or use the wizard:"
+  echo "  3. Or wizard:"
   echo "     docker compose run --rm openclaw configure"
   echo ""
   echo "  4. Logs:"
   echo "     docker compose logs -f openclaw"
   echo ""
+
+  if [ "$DEPLOY_MODE" = "vps" ]; then
+    echo "  5. Set LINE webhook URL to:"
+    echo "     https://openclaw.$DOMAIN_NAME/webhook/line"
+    echo ""
+    echo "  Make sure DNS points openclaw.$DOMAIN_NAME → this server's IP"
+    echo ""
+  fi
+
   echo "============================================================================"
   echo ""
 }
@@ -306,13 +434,12 @@ main() {
   echo ""
   printf "${CYAN}  OpenClaw Docker Setup${NC}\n"
   echo "  Only requirement: Docker"
-  echo ""
 
   check_docker
+  ask_mode
   setup_dirs
   write_dockerfile
   write_compose
-  write_env
   write_workspace
   write_config
 
